@@ -1,0 +1,29 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "scrape:celestyal": "node scripts/runTenant.js celestyal",
+    "scrape:seawebagents": "node scripts/runTenant.js seawebagents",
+    "scrape:goccl": "node scripts/runTenant.js goccl",
+    "scrape:thesea": "node scripts/runTenant.js thesea",
+    "scrape:cruisingpower": "node scripts/runTenant.js cruisingpower",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^17.3.1",
+    "mysql2": "^3.19.1",
+    "node-cron": "^4.2.1",
+    "playwright": "^1.58.2",
+    "playwright-core": "^1.58.2",
+    "prisma": "^5.22.0"
+  }
+}

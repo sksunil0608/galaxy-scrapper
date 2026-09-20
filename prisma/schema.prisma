@@ -1,0 +1,362 @@
+generator client {
+  provider   = "prisma-client-js"
+  engineType = "binary"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+//////////////////////////////////////////////////////
+// USER / ROLE SYSTEM
+//////////////////////////////////////////////////////
+
+model User {
+  id       Int    @id @default(autoincrement())
+  name     String
+  email    String @unique
+  password String
+
+  roleId    Int      @map("role_id")
+  createdAt DateTime @default(now())
+
+  role Role @relation(fields: [roleId], references: [id])
+
+  @@index([roleId])
+}
+
+model Role {
+  id   Int    @id @default(autoincrement())
+  name String
+
+  permissions RolePermission[]
+  users       User[]
+}
+
+model Permission {
+  id   Int    @id @default(autoincrement())
+  key  String @unique
+  name String
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  id Int @id @default(autoincrement())
+
+  roleId       Int @map("role_id")
+  permissionId Int @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id])
+  permission Permission @relation(fields: [permissionId], references: [id])
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+}
+
+//////////////////////////////////////////////////////
+// CORE BUSINESS MODELS
+//////////////////////////////////////////////////////
+
+model Vendor {
+  id   Int     @id @default(autoincrement())
+  name String
+  slug String? @unique
+  url  String?
+
+  ships   Ship[]
+  cruises Cruise[]
+  runs    VendorRun[]
+}
+
+model VendorRun {
+  id                  Int       @id @default(autoincrement())
+  vendorId            Int       @map("vendor_id")
+  status              String
+  healthScore         Int       @default(0) @map("health_score")
+  responseTimeMs      Int?      @map("response_time_ms")
+  startedAt           DateTime  @map("started_at")
+  finishedAt          DateTime? @map("finished_at")
+  cruisesSeen         Int       @default(0) @map("cruises_seen")
+  shipsSeen           Int       @default(0) @map("ships_seen")
+  cabinCategoriesSeen Int       @default(0) @map("cabin_categories_seen")
+  errorCount          Int       @default(0) @map("error_count")
+  notes               String?
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+
+  @@index([vendorId])
+  @@index([finishedAt])
+}
+
+model Ship {
+  id            Int      @id @default(autoincrement())
+  code          String   @unique
+  name          String
+  vendorId      Int?     @map("vendor_id")
+  image         String?
+  cabins        Int?
+  restaurants   Int?
+  bars          Int?
+  pools         Int?
+  jacuzzis      Int?
+  guests        Int?
+  crew          Int?
+  balconyCabins Int?
+  suites        Int?
+  spa           String?
+  createdAt     DateTime @default(now())
+
+  vendor  Vendor?  @relation(fields: [vendorId], references: [id])
+  cruises Cruise[]
+
+  @@index([vendorId])
+}
+
+model Cruise {
+  id Int @id @default(autoincrement())
+
+  // Unique per vendor, NOT globally: CCS A/B (and GoHAL-Cunard vs CCS-Cunard)
+  // share POLAR voyage codes — each vendor owns its own row for the same code.
+  code String
+
+  vendorId Int  @map("vendor_id")
+  shipId   Int? @map("ship_id")
+
+  ship       String?
+  shipCode   String?
+  cruiseLine String? @map("cruise_line")
+
+  package    String?
+  routeLabel String?
+
+  portFrom String?
+  portTo   String?
+
+  nights Int?
+
+  startDate DateTime?
+  endDate   DateTime?
+
+  trend      String?
+  confidence String?
+  pinned     Boolean @default(false)
+
+  currency String?
+
+  createdAt       DateTime  @default(now())
+  cabinsUpdatedAt DateTime? @map("cabins_updated_at")
+  // cabinsUpdatedAt only moves when a detail/deck pass runs, so list-only runs
+  // left the UI's "Refreshed" column showing "—" forever. This one bumps on
+  // every write, giving every row a last-seen time.
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  vendor  Vendor @relation(fields: [vendorId], references: [id])
+  shipRef Ship?  @relation(fields: [shipId], references: [id])
+
+  promotions      CruisePromotion[]
+  cabinCategories CabinCategory[]
+  itineraryStops  ItineraryStop[]
+  tags            CruiseTag[]
+  alerts          CruiseTagAlert[]
+
+  @@unique([vendorId, code])
+  @@index([vendorId])
+  @@index([shipId])
+  @@index([cruiseLine])
+  @@index([code])
+}
+
+model ItineraryStop {
+  id       Int       @id @default(autoincrement())
+  cruiseId Int       @map("cruise_id")
+  day      Int?
+  date     DateTime?
+  time     String?
+  activity String?
+  port     String?
+  country  String?
+  order    Int?
+
+  cruise Cruise @relation(fields: [cruiseId], references: [id])
+
+  @@index([cruiseId])
+}
+
+// NOTE: the old `ShipItineraryReference` model lived here. Its table
+// (shipitineraryreference) was dropped when StaticItinerary replaced it — the
+// old table's cruise_id column was entirely null, i.e. it was never actually
+// used. The model definition outlived the table, so any query that touched
+// Cruise.itineraryRefs blew up with P2021 "table does not exist". Removed
+// along with the Cruise.itineraryRefs back-relation.
+
+//////////////////////////////////////////////////////
+// PROMOTIONS
+//////////////////////////////////////////////////////
+
+model CruisePromotion {
+  id       Int @id @default(autoincrement())
+  cruiseId Int
+
+  name String
+
+  cruise Cruise @relation(fields: [cruiseId], references: [id])
+
+  @@index([cruiseId])
+}
+
+//////////////////////////////////////////////////////
+// CABIN CATEGORY
+//////////////////////////////////////////////////////
+
+model CabinCategory {
+  id Int @id @default(autoincrement())
+
+  cruiseId Int
+
+  code  String
+  name  String
+  group String?
+
+  status    String?
+  avlResult String?
+
+  totalCabins Int?
+  available   Int?
+
+  cabinPrice     Decimal? @db.Decimal(10, 2)
+  perPersonPrice Decimal? @db.Decimal(10, 2)
+
+  capacity Int?
+
+  trend      String?
+  confidence String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  cruise Cruise @relation(fields: [cruiseId], references: [id])
+
+  promotions CabinPromotion[]
+  cabins     Cabin[]
+
+  @@unique([cruiseId, code])
+  @@index([cruiseId])
+}
+
+model Cabin {
+  id              Int     @id @default(autoincrement())
+  cabinCategoryId Int     @map("cabin_category_id")
+  cabinNumber     String  @map("cabin_number")
+  deckNumber      Int?    @map("deck_number")
+  deckName        String? @map("deck_name")
+  capacity        Int?
+  status          String?
+
+  cabinCategory CabinCategory @relation(fields: [cabinCategoryId], references: [id])
+
+  @@unique([cabinCategoryId, cabinNumber])
+  @@index([cabinCategoryId])
+}
+
+//////////////////////////////////////////////////////
+// CABIN PROMOTIONS
+//////////////////////////////////////////////////////
+
+model CabinPromotion {
+  id Int @id @default(autoincrement())
+
+  cabinCategoryId Int
+
+  name String
+
+  cabinCategory CabinCategory @relation(fields: [cabinCategoryId], references: [id])
+
+  @@index([cabinCategoryId])
+}
+
+//////////////////////////////////////////////////////
+// TAGS & ALERTS
+//////////////////////////////////////////////////////
+
+model CruiseTag {
+  id                 Int       @id @default(autoincrement())
+  cruiseId           Int       @map("cruise_id")
+  label              String
+  assignedTo         String?   @map("assigned_to")
+  note               String?
+  color              String?
+  trackedLowestPrice Decimal?  @map("tracked_lowest_price") @db.Decimal(10, 2)
+  lastSeenPrice      Decimal?  @map("last_seen_price") @db.Decimal(10, 2)
+  lastPriceDropAt    DateTime? @map("last_price_drop_at")
+  lastNotifiedPrice  Decimal?  @map("last_notified_price") @db.Decimal(10, 2)
+  categorySnapshot   Json?     @map("category_snapshot")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  cruise Cruise           @relation(fields: [cruiseId], references: [id])
+  alerts CruiseTagAlert[]
+
+  @@index([cruiseId])
+  @@index([label])
+  @@index([assignedTo])
+}
+
+model CruiseTagAlert {
+  id            Int       @id @default(autoincrement())
+  cruiseTagId   Int       @map("cruise_tag_id")
+  cruiseId      Int       @map("cruise_id")
+  previousPrice Decimal?  @map("previous_price") @db.Decimal(10, 2)
+  currentPrice  Decimal   @map("current_price") @db.Decimal(10, 2)
+  currency      String?
+  status        String    @default("unread")
+  emailSent     Boolean   @default(false) @map("email_sent")
+  emailSentAt   DateTime? @map("email_sent_at")
+  readAt        DateTime? @map("read_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  cruiseTag CruiseTag @relation(fields: [cruiseTagId], references: [id])
+  cruise    Cruise    @relation(fields: [cruiseId], references: [id])
+
+  @@index([cruiseTagId])
+  @@index([cruiseId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// Static itinerary reference data imported from Book1.xlsx — port-by-port
+// stops for known ship+route combinations. Scraped cruises skip the slow
+// per-cruise itinerary fetch; instead a matching row from this table supplies
+// the stops (see services/staticItineraryService.js).
+model StaticItinerary {
+  id        Int      @id @default(autoincrement())
+  shipName  String   @map("ship_name")
+  shipKey   String   @map("ship_key") // normalized lookup key
+  portFrom  String?  @map("port_from")
+  portTo    String?  @map("port_to")
+  routeKey  String   @map("route_key") // normalized "from|to"
+  stops     Json     // ordered array of port-name strings
+  nights    Int?
+  dealsLink String?  @map("deals_link") @db.Text
+  price     Decimal? @db.Decimal(10, 2)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  @@index([shipKey])
+  @@index([shipKey, routeKey])
+}
+
+// Port-name synonym mappings so vendor-specific codes (e.g. GOCCL's "MIA",
+// MSC's "CVV") resolve to the same normalized port as Book1.xlsx's plain
+// names. Editable via the Itinerary Manager UI in cruisesaga.frontend — no
+// code deploy needed to teach the matcher a new vendor code.
+model PortAlias {
+  id        Int      @id @default(autoincrement())
+  aliasKey  String   @unique @map("alias_key") // normalized input, e.g. "mia"
+  canonical String   // normalized target, e.g. "miami"
+  note      String?  // optional human note, e.g. "GOCCL 3-letter code"
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([aliasKey])
+}

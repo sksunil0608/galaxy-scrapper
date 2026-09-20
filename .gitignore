@@ -1,0 +1,23 @@
+node_modules
+.env
+.env.*
+!.env.example
+
+# browser profiles and login sessions created when the scrapers run - never commit
+sessions/
+*-user-data/
+.auth/
+
+# runtime output and debug artifacts
+output/
+debug/
+*.log
+*.png
+debug_page.html
+*-debug.html
+*-debug.txt
+live-*
+tmp_*
+.DS_Store
+
+/generated/prisma
