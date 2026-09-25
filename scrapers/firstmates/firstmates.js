@@ -630,12 +630,33 @@ async function fetchFirstMatesCabinData(page, match) {
   }
 
   const ctgFrame = await selectVoyageAndContinue(searchFrame, page, match.id);
-  await expandAllCategoryGroups(ctgFrame);
 
   // Codes actually rendered on the live Cabins page are the source of truth
   // for which categories are bookable — not the bulk search's ctgsVal, which
   // can list a different rate-plan snapshot.
-  const visibleCodes = await readVisibleCategoryCodes(ctgFrame);
+  //
+  // But the page renders its category groups progressively, and the reader
+  // returns as soon as it sees ANY code. On a busy machine that meant a half-
+  // rendered page (8 of 17 categories) was taken as the full list, the rest were
+  // saved with 0 cabins, and a good 1219-cabin sailing was overwritten with 81.
+  // So: while the search says more categories are available than the page shows,
+  // wait and expand again; if it still doesn't add up, fail without saving.
+  const expectedOk = (match.cabinCategories ?? []).filter((c) => c.avlResult === "OK").map((c) => c.code);
+  const allowedMissing = Math.floor(expectedOk.length * 0.2);
+  let visibleCodes = [];
+  let missingCodes = [];
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await expandAllCategoryGroups(ctgFrame);
+    visibleCodes = await readVisibleCategoryCodes(ctgFrame);
+    missingCodes = expectedOk.filter((c) => !visibleCodes.includes(c));
+    if (missingCodes.length <= allowedMissing) break;
+    console.log(`[firstmates] ${match.id}: page shows ${visibleCodes.length} categories but the search lists ${expectedOk.length} as available (missing ${missingCodes.join(", ")}) — waiting for the page to finish rendering (${attempt}/4)`);
+    await page.waitForTimeout(4000);
+  }
+  if (missingCodes.length > allowedMissing) {
+    await firstMatesWizardCleanup(page).catch(() => {});
+    throw new Error(`FirstMates: category list incomplete for ${match.id} (page rendered ${visibleCodes.length} of ${expectedOk.length} available categories) — not overwriting cabin data`);
+  }
   console.log(`[firstmates] ${match.id}: visible category codes on page: ${visibleCodes.join(", ")}`);
 
   const byCode = new Map(match.cabinCategories.map((c) => [c.code, c]));

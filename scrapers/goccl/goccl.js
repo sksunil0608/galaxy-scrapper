@@ -706,8 +706,16 @@ function normalizeGocclCabin(stateroom) {
 
 function buildCabinCategoriesFromDeckData(categoryJson, statewroomByCategory) {
   return (categoryJson?.categories ?? []).map((cat) => {
-    const stateroomResp = statewroomByCategory.get(cat.code);
-    const cabins = (stateroomResp?.deck?.staterooms ?? []).map(normalizeGocclCabin);
+    // One response per deck the category spans (see fetchGocclDeckDataForSailingInner).
+    const seenCabins = new Set();
+    const cabins = [].concat(statewroomByCategory.get(cat.code) ?? [])
+      .flatMap((resp) => (resp?.deck?.staterooms ?? []).map((s) => normalizeGocclCabin(s.deck ? s : { ...s, deck: resp.deck })))
+      .filter((c) => {
+        if (c.cabinNumber == null) return true;
+        if (seenCabins.has(c.cabinNumber)) return false;
+        seenCabins.add(c.cabinNumber);
+        return true;
+      });
     const type = mapMetaCodeToType(cat.stateroomType?.code, cat.stateroomType?.name);
 
     return {
@@ -907,7 +915,8 @@ async function fetchGocclDeckDataForSailingInner(page, sailing, options, apiBase
     // restriction, not a scan bug: no amount of retrying/re-navigating will
     // produce cabin data for a sailing the site won't quote a rate for.
     if (rateResp && rateResp.status() === 409) {
-      console.log(`[goccl-decks] ${fp}: sailing rejected by site (HTTP 409 — not bookable, likely too close to sail date) — no cabin data available`);
+      const why = (await rateResp.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 240) || "(empty body)";
+      console.log(`[goccl-decks] ${fp}: sailing rejected by site (HTTP 409 — not bookable, likely too close to sail date) — no cabin data available. Site said: ${why}`);
       return [];
     }
 
@@ -1012,8 +1021,16 @@ async function fetchGocclDeckDataForSailingInner(page, sailing, options, apiBase
 
   const primedJson = await primeResp.json().catch(() => null);
   const primedCode = new URL(primeReq.url()).searchParams.get("categoryCode") ?? firstCatCode;
+  if (process.env.GOCCL_DEBUG_DUMP && primedJson) {
+    // Inspect the raw /availability/stateroom shape (which decks does a category span?).
+    try {
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      mkdirSync("debug", { recursive: true });
+      writeFileSync(`debug/goccl-stateroom-${Date.now()}.json`, JSON.stringify({ url: primeReq.url(), headers: Object.keys(primeReq.headers()), json: primedJson, categorySample: categoryJson.categories.slice(0, 1), categoryDecks: categoryJson.categories.map((c) => ({ code: c.code, decks: c.decks })), categoryKeys: Object.keys(categoryJson) }, null, 1));
+    } catch { /* debug aid only */ }
+  }
   if (primedJson) {
-    statewroomByCategory.set(primedCode, primedJson);
+    statewroomByCategory.set(primedCode, [primedJson]);
     console.log(`[goccl-decks] ${fp}: ${primedCode} — ${primedJson.deck?.staterooms?.length ?? 0} cabins on ${primedJson.deck?.name ?? "?"} (primed via click)`);
   }
 
@@ -1023,23 +1040,65 @@ async function fetchGocclDeckDataForSailingInner(page, sailing, options, apiBase
     if (!["host", "content-length", "cookie"].includes(k.toLowerCase())) primedHeaders[k] = v;
   }
 
-  const remaining = categoryJson.categories.slice(0, limit).filter((c) => c.code !== primedCode);
-  for (const cat of remaining) {
+  if (process.env.GOCCL_DEBUG_DUMP) {
+    // Which query parameter makes /availability/stateroom return another deck of a
+    // multi-deck category? Try the likely names and record which one changes deck.code.
+    try {
+      const multi = categoryJson.categories.find((c) => (c.decks ?? []).length > 1);
+      if (multi) {
+        const alt = multi.decks[1];
+        const results = {};
+        for (const name of ["deckCode", "deckNumber", "deck", "deckId", "selectedDeck", "deckNo", "stateroomDeck"]) {
+          const p = new URLSearchParams(primedUrl.search);
+          p.set("categoryCode", multi.code);
+          p.set(name, alt.code);
+          results[name] = await page.evaluate(async ({ url, headers }) => {
+            const res = await fetch(url, { credentials: "include", headers });
+            const j = res.status === 200 ? await res.json().catch(() => null) : null;
+            return { status: res.status, deck: j?.deck?.code ?? null, cabins: j?.deck?.staterooms?.length ?? null };
+          }, { url: `${primedUrl.origin}${primedUrl.pathname}?${p.toString()}`, headers: primedHeaders }).catch((e) => ({ error: e.message }));
+        }
+        const { mkdirSync, writeFileSync } = await import("node:fs");
+        mkdirSync("debug", { recursive: true });
+        writeFileSync(`debug/goccl-deckparam-${Date.now()}.json`, JSON.stringify({ category: multi.code, decks: multi.decks, wantedDeck: alt.code, results }, null, 1));
+      }
+    } catch { /* debug aid only */ }
+  }
+
+  // A category can span several decks (e.g. 8L: decks 15/12/9/11/14/10), but the
+  // stateroom endpoint answers ONE deck per request — the first unless ?deckCode= is
+  // given (verified: deckCode=12 returned deck 12's cabins). Reading only that
+  // default deck silently dropped every cabin on the category's other decks. The
+  // category response lists the decks (`decks: [{code, name}]`), so ask for each.
+  const fetchStateroomDeck = (catCode, deckCode) => {
     const params = new URLSearchParams(primedUrl.search);
-    params.set("categoryCode", cat.code);
-    const url = `${primedUrl.origin}${primedUrl.pathname}?${params.toString()}`;
-    const result = await page.evaluate(async ({ url, headers }) => {
+    params.set("categoryCode", catCode);
+    if (deckCode) params.set("deckCode", deckCode);
+    return page.evaluate(async ({ url, headers }) => {
       const res = await fetch(url, { credentials: "include", headers });
       const status = res.status;
       const json = status === 200 ? await res.json().catch(() => null) : null;
       return { status, json };
-    }, { url, headers: primedHeaders }).catch((err) => ({ status: "error", error: err.message }));
+    }, { url: `${primedUrl.origin}${primedUrl.pathname}?${params.toString()}`, headers: primedHeaders })
+      .catch((err) => ({ status: "error", error: err.message }));
+  };
 
-    if (result.status === 200 && result.json) {
-      statewroomByCategory.set(cat.code, result.json);
-      console.log(`[goccl-decks] ${fp}: ${cat.code} — ${result.json.deck?.staterooms?.length ?? 0} cabins on ${result.json.deck?.name ?? "?"} (direct fetch)`);
-    } else {
-      console.log(`[goccl-decks] ${fp}: ${cat.code} — direct fetch failed (status=${result.status})`);
+  for (const cat of categoryJson.categories.slice(0, limit)) {
+    // the primed click already returned this category's default deck
+    const have = cat.code === primedCode && primedJson?.deck?.code != null ? new Set([String(primedJson.deck.code)]) : new Set();
+    const deckCodes = (cat.decks ?? []).map((d) => String(d.code)).filter((d) => d && d !== "undefined" && !have.has(d));
+    // no deck list published: a single default-deck request, as before
+    const wanted = deckCodes.length ? deckCodes : (cat.code === primedCode ? [] : [null]);
+    for (const deckCode of wanted) {
+      const result = await fetchStateroomDeck(cat.code, deckCode);
+      if (result.status === 200 && result.json) {
+        const list = statewroomByCategory.get(cat.code) ?? [];
+        list.push(result.json);
+        statewroomByCategory.set(cat.code, list);
+        console.log(`[goccl-decks] ${fp}: ${cat.code} — ${result.json.deck?.staterooms?.length ?? 0} cabins on ${result.json.deck?.name ?? "?"} (direct fetch${deckCode ? `, deckCode=${deckCode}` : ""})`);
+      } else {
+        console.log(`[goccl-decks] ${fp}: ${cat.code}${deckCode ? ` deck ${deckCode}` : ""} — direct fetch failed (status=${result.status})`);
+      }
     }
   }
 
