@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import dotenv from "dotenv";
 import { createScraperSession } from "../runtime.js";
 
@@ -49,6 +50,18 @@ function parseFormFieldsFromHtml(html) {
 
 function htmlTitle(html) {
   return html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1] ?? "";
+}
+
+// CCS_DEBUG_DUMP=1 saves the raw HTML of a POLAR page to debug/ so a layout the
+// flow doesn't know yet (Princess's ship-zone pages) can be inspected offline.
+function dumpPolarPage(tag, html) {
+  if (!process.env.CCS_DEBUG_DUMP) return;
+  try {
+    fs.mkdirSync("debug", { recursive: true });
+    const file = `debug/polar-${tag}-${Date.now()}.html`;
+    fs.writeFileSync(file, html);
+    console.log(`      [debug] dumped ${htmlTitle(html) || "(no title)"} → ${file}`);
+  } catch { /* debug aid only */ }
 }
 
 // Parse RDLC cabin rows from displayRow() JS calls in script blocks.
@@ -138,17 +151,58 @@ async function polarHttpPost(page, fields, key, stateToken) {
   return resp.text();
 }
 
+// The RDLC cabin screen holds 9 rows. A category with more cabins fills it and the
+// rest sit on the following pages (PF8 = page forward). Reading only the first
+// page silently cut every large category at exactly 9 cabins. Keeps paging while a
+// page is full and still yields cabins we haven't seen; returns the last page's
+// html so the caller's PF12 back-navigation starts from the page POLAR is on.
+async function collectRdlcPages(workPage, firstHtml, firstCabins, stateToken) {
+  const slots = (firstHtml.match(/displayRow\s*\(\s*t\s*\(\s*["']CABIN_/gi) ?? []).length;
+  const cabins = [...firstCabins];
+  const seen = new Set(cabins.map((c) => c.cabinNumber));
+  let html = firstHtml;
+  let pageSize = firstCabins.length;
+  for (let page = 2; page <= 40 && slots > 0 && pageSize >= slots; page++) {
+    const nextHtml = await polarHttpPost(workPage, parseFormFieldsFromHtml(html), "DFH_PF8", stateToken);
+    const nextTitle = htmlTitle(nextHtml);
+    if (!(nextTitle.includes("RDLC") || nextTitle.toLowerCase().includes("cabin selection"))) {
+      console.log(`      [paging] page ${page}: landed on "${nextTitle}" — stopping (kept ${cabins.length} cabins)`);
+      html = nextHtml;
+      break;
+    }
+    const pageCabins = parseCabinListFromJs(nextHtml);
+    const fresh = pageCabins.filter((c) => !seen.has(c.cabinNumber));
+    if (!fresh.length) break;
+    for (const c of fresh) { seen.add(c.cabinNumber); cabins.push(c); }
+    console.log(`      [paging] page ${page}: +${fresh.length} cabins (${cabins.length} so far)`);
+    html = nextHtml;
+    pageSize = pageCabins.length;
+  }
+  return { cabins, lastHtml: html };
+}
+
 // Fetch cabins for one RDIC category via direct HTTP POSTs (no browser navigation).
 // Chain: RDIC POST → RDLE → [RDLD notice pages] → [RDIF upsell] → RDLC → PF12 back to RDIC.
 async function getCabinsForCategoryDirect(workPage, rdicF, selCatField, selFareField, catCode, stateToken) {
   // SELCAT is always the first 2 chars of the displayRow category argument
   const baseCode = catCode.length >= 3 ? catCode.slice(0, 2) : catCode;
   let catF    = { ...rdicF, [selCatField]: baseCode, [selFareField]: "1" };
-  let catHtml = await polarHttpPost(workPage, catF, "DFH_ENTER", stateToken);
-  let catTitle = htmlTitle(catHtml);
+  const catHtml = await polarHttpPost(workPage, catF, "DFH_ENTER", stateToken);
+  const catTitle = htmlTitle(catHtml);
 
   // If SELCAT was rejected, CICS returns us to RDIC
   if (catTitle.includes("RDIC") || catTitle.includes("Category Fares")) return [];
+
+  return readCabinListFromSelection(workPage, catHtml, stateToken, ["RDIC", "Category Fares"]);
+}
+
+// From the response to a category/row selection: walk forward through POLAR's
+// notice / upsell / zone pages to the cabin list, parse it, then PF12 back to
+// the page whose title contains one of `backTitles` (RDIC for the normal
+// Category Fares layout, RDIN for Princess's zone-and-deck layout).
+async function readCabinListFromSelection(workPage, firstHtml, stateToken, backTitles) {
+  let catHtml  = firstHtml;
+  let catTitle = htmlTitle(catHtml);
 
   // Navigate forward through notice pages to RDLC (or RDIA stateroom)
   for (let n = 0; n < 8; n++) {
@@ -157,6 +211,9 @@ async function getCabinsForCategoryDirect(workPage, rdicF, selCatField, selFareF
     if ((catTitle.includes("RDIA") || catTitle.toLowerCase().includes("stateroom"))
         && !catTitle.includes("Important Notices")) break;
     if (catTitle.includes("RDIC") || catTitle.includes("Category Fares")) break;
+    // RDIN = Princess "Availability By Zone And Deck". Re-posting ENTER without a
+    // row selected just returns the same page (it used to loop here 8 times).
+    if (catTitle.includes("RDIN")) break;
     if (catTitle.includes("CICS Web") || catTitle.includes("MAIN MENU")) break;
     const postF = parseFormFieldsFromHtml(catHtml);
     // RDIA notice page: CICS reads hidden RECAPPFL field (set by setRecap()), not the checkbox
@@ -170,44 +227,244 @@ async function getCabinsForCategoryDirect(workPage, rdicF, selCatField, selFareF
     // (Aft / Mid-Aft / Midship / Mid-Forward / Forward) before it'll show cabins
     // — P&O and Cunard never hit this page. Its rows are rendered by
     // displayRow(selPre, selFld, selVal, zoneDesc, zoneStat, zoneRate, zoneFare)
-    // JS calls; zoneStat "C" means confirmed availability, "W" means waitlist.
+    // JS calls; zoneStat "C" means closed (sold out), "W" waitlist, anything else open.
     // Selecting a zone just means POSTing that zone's hidden field with "S" (the
     // page's own setSelVal() does exactly this), so this stays a direct POST.
     if (catTitle.includes("RDIM")) {
-      const zoneRe = /displayRow\([^,]+,\s*"([^"]+)",\s*"[^"]*",\s*"([^"]*)",\s*"([CW ])",/g;
-      const zones = [...catHtml.matchAll(zoneRe)]
-        .map(([, field, desc, status]) => ({ field, desc: desc.trim(), status }))
-        .filter(z => z.desc);
-      const zone = zones.find(z => z.status === "C") ?? zones[0];
+      const zones = parseZoneRows(catHtml);
+      const zone = zones.find(z => isBookableStatus(z.status)) ?? zones.find(z => z.status === "W") ?? zones[0];
       if (!zone) {
         console.log(`      [warn] RDIM page had no selectable zones — returning empty cabin list`);
         break;
       }
-      console.log(`      [zone] selecting "${zone.desc}" (${zone.status === "C" ? "confirmed" : "waitlist"})`);
+      console.log(`      [zone] selecting "${zone.desc}" (status ${zone.status || "?"})`);
       postF[zone.field] = "S";
     }
     catHtml  = await polarHttpPost(workPage, postF, "DFH_ENTER", stateToken);
     catTitle = htmlTitle(catHtml);
+    if (catTitle.includes("RDIN")) dumpPolarPage("RDIN", catHtml);
   }
 
   const isWtl  = catHtml.toLowerCase().includes("waitlist only") || catHtml.toLowerCase().includes("available for waitlist");
   const isRdlc = catTitle.includes("RDLC") || catTitle.toLowerCase().includes("cabin selection");
   const isRdia = catTitle.includes("RDIA") || catTitle.toLowerCase().includes("stateroom");
-  const cabins = isWtl ? [] : isRdlc ? parseCabinListFromJs(catHtml) : isRdia ? parseCabinListFromRdiaHtml(catHtml) : [];
+  let cabins = isWtl ? [] : isRdlc ? parseCabinListFromJs(catHtml) : isRdia ? parseCabinListFromRdiaHtml(catHtml) : [];
+  if (cabins.length) dumpPolarPage(isRdlc ? "cabinlist-RDLC" : "cabinlist-RDIA", catHtml);
+  // POLAR answered "RDLC-0126I CATEGORY AVAILABLE FOR WAITLIST ONLY": no cabin numbers exist to list.
+  // Flag the (empty) result so the caller stores the category as Waitlist, not Available.
+  if (isWtl) cabins.waitlistOnly = true;
+  if (!cabins.length) dumpPolarPage(`empty-${isWtl ? "WTL" : isRdlc ? "RDLC" : isRdia ? "RDIA" : "other"}`, catHtml);
+  if (isRdlc && !isWtl && cabins.length) {
+    const paged = await collectRdlcPages(workPage, catHtml, cabins, stateToken);
+    cabins  = paged.cabins;
+    catHtml = paged.lastHtml;
+  }
   if (!isWtl && !isRdlc && !isRdia) {
     console.log(`      [warn] unrecognized cabin page title "${catTitle}" — returning empty cabin list`);
   }
 
-  // PF12 back to RDIC
+  // PF12 back to the selection page we started from
   let bkHtml = catHtml, bkTitle = catTitle;
   for (let b = 0; b < 8; b++) {
-    if (bkTitle.includes("RDIC") || bkTitle.includes("Category Fares")) break;
+    if (backTitles.some((t) => bkTitle.includes(t))) break;
     if (bkTitle.includes("MAIN MENU") || bkTitle.includes("CICS Web")) break;
     bkHtml  = await polarHttpPost(workPage, parseFormFieldsFromHtml(bkHtml), "DFH_PF12", stateToken);
     bkTitle = htmlTitle(bkHtml);
   }
 
   return cabins;
+}
+
+// ── Princess ship-zone layout (RDIM → RDIN) ───────────────────────────────────
+// Some Princess voyages skip Category Fares: after the packages page POLAR shows
+// RDIM "Voyage Pricing By Ship Zone" (Aft / Mid-Aft / Midship / Mid-Forward /
+// Forward) and picking a zone opens RDIN "Availability By Zone And Deck" — one
+// row per deck + category with its status (C confirmed / W waitlist), FIT price
+// and promo. Picking a row leads on through the usual notice pages to the cabin
+// list. extractFareTable used to read the zone rows as if they were cabin
+// categories (junk codes like "F090010001_DFH0001", 0 cabins), and the
+// stateroom POSTs that followed made CICS error out and poisoned the session.
+
+const isAvailabilityByDate = (title) => title.includes("RDLV") || title.includes("Availability by Date");
+
+function parsePolarPrice(text) {
+  const n = parseFloat(String(text ?? "").replace(/[,*\s]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+// The quoted arguments of every displayRow(...) call in a POLAR page's script.
+function parseDisplayRowCalls(html) {
+  const callRe = /displayRow\(((?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^'")])*)\)/g;
+  const strRe  = /'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g;
+  const calls = [];
+  for (const m of html.matchAll(callRe)) {
+    const args = [...m[1].matchAll(strRe)].map((a) => a[1] ?? a[2] ?? "");
+    if (args.length) calls.push(args);
+  }
+  return calls;
+}
+
+// RDIM: displayRow(selPre, selFld, selVal, zoneDesc, zoneStat, zoneRate, zoneFare)
+function parseZoneRows(html) {
+  return parseDisplayRowCalls(html)
+    .filter((a) => a.length >= 7 && a[3].trim())
+    .map((a) => ({ field: a[1], desc: a[3].trim(), status: a[4].trim(), price: parsePolarPrice(a[5]) }));
+}
+
+// RDIN: displayRow(selPre, selVal, selFld, deckNbr, deckDesc, metaDesc, metaPreSuf,
+//                  categ, categPreSuf, cat1Avl, cat1Amt, cat1Promo, cat2Avl, cat2Amt, cat2Promo, otherZone)
+// cat1 is the FIT column, cat2 the GROUP column — only FIT is used.
+function parseZoneDeckRows(html) {
+  return parseDisplayRowCalls(html)
+    .filter((a) => a.length >= 16 && a[7].trim())
+    .map((a) => ({
+      field:      a[2],
+      selectable: a[0].includes('type="text"'),
+      deckNumber: parseInt(a[3], 10) || null,
+      deckName:   a[4].trim(),
+      type:       a[5].trim(),
+      code:       a[7].trim(),
+      status:     a[9].trim(),
+      price:      parsePolarPrice(a[10]),
+      promo:      a[11].trim(),
+    }));
+}
+
+const ZONE_TYPE_TO_GROUP = {
+  "suite": "Suite", "suites": "Suite", "mini-suite": "Mini-Suite", "balcony": "Balcony",
+  "oceanview": "Exterior", "outside": "Exterior", "obstructed": "Exterior", "interior": "Interior", "inside": "Interior",
+};
+
+// Values of the controls POLAR builds with JavaScript (stateroom type, ship zone,
+// berths, air status...). They are not in the raw HTML as <input>/<select>, but
+// the browser submits them, and leaving them out makes POLAR read the POST as a
+// filter change and redisplay the same page instead of accepting a selection.
+// The second argument of each populate…Dropdown(name, selectedValue, …) call is
+// the current value.
+function parseJsBuiltFields(html) {
+  const f = {};
+  const re = /populate(?:Air)?Dropdown(?:ByBrand)?\(\s*["'](F\d{9}_[A-Z0-9-]+)["']\s*,\s*["']([^"']*)["']/g;
+  for (const m of html.matchAll(re)) f[m[1]] = m[2];
+  return f;
+}
+
+// Status codes on RDIM/RDIN, as POLAR reports them: C = closed (sold out — picking
+// it answers "RDIN-0144E NO SPACE AVAILABLE - CATEGORY IS SOLD OUT"), W = waitlist,
+// N = none; anything else on a selectable row is an open seat count.
+const isBookableStatus = (st) => st !== "" && !["C", "W", "N"].includes(st.toUpperCase());
+
+const ZONE_TYPES = [["S", "Suite"], ["M", "Mini-Suite"], ["B", "Balcony"], ["O", "Oceanview"], ["I", "Interior"]];
+
+// POLAR filters both RDIM and RDIN by stateroom type (default Mini-Suite), so
+// the complete category list needs a walk of type × zone × deck row.
+// Categories are the unique category codes seen (one code can recur on several
+// decks/zones); a category's cabins are the union of every confirmed deck row's
+// stateroom list, stamped with that row's deck and zone.
+// Leaves POLAR on RDIM, the page the browser is still showing.
+async function getPricingByShipZone(workPage, rdimHtml, stateToken, maxCategories = Infinity) {
+  const rdimJs    = parseJsBuiltFields(rdimHtml);
+  const typeField = Object.keys(rdimJs).find((k) => k.endsWith("-STROOMTYP")) ?? null;
+  const rdimF     = { ...rdimJs, ...parseFormFieldsFromHtml(rdimHtml) };
+  const types     = typeField ? ZONE_TYPES : [[null, "all"]];
+  const cats = new Map();
+  let serverType = typeField ? rdimJs[typeField] : null;
+
+  typeLoop:
+  for (const [typeCode, typeLabel] of types) {
+    const typeF = typeField ? { ...rdimF, [typeField]: typeCode } : rdimF;
+
+    // RDIM for this type (the page we arrived on already is the default type's)
+    let zonesHtml = rdimHtml;
+    if (typeField && typeCode !== serverType) {
+      zonesHtml = await polarHttpPost(workPage, typeF, "DFH_ENTER", stateToken);
+      if (!htmlTitle(zonesHtml).includes("RDIM")) {
+        console.warn(`      [zone] ${typeLabel}: expected RDIM, got "${htmlTitle(zonesHtml)}" — stopping the zone walk`);
+        break;
+      }
+      serverType = typeCode;
+    }
+    const allZones = parseZoneRows(zonesHtml);
+    const zones = allZones.filter((z) => z.status && !["C", "N"].includes(z.status.toUpperCase()));
+    console.log(`    [zone] ${typeLabel}: ${zones.length} ship zone(s): ${zones.map((z) => `${z.desc}=${z.status}`).join(", ")}`);
+    // POLAR remembers the last zone picked, so a second pick without clearing the
+    // others answers RDIM-0124I TOO MANY SELECTIONS — blank every zone field first
+    const clearZones = Object.fromEntries(allZones.map((z) => [z.field, ""]));
+
+    for (const zone of zones) {
+      let html = await polarHttpPost(workPage, { ...typeF, ...clearZones, [zone.field]: "S" }, "DFH_ENTER", stateToken);
+      const zoneTitle = htmlTitle(html);
+      if (zoneTitle.includes("RDIM")) {
+        // still on the zone page (POLAR redisplayed it, usually with a message) — the state is intact, try the next zone
+        const why = html.match(/RDIM-\d+[A-Z][^<"]{0,120}/)?.[0]?.replace(/\s+/g, " ").trim() ?? "no message";
+        console.log(`      [zone] ${typeLabel}/${zone.desc}: not opened (${why})`);
+        dumpPolarPage(`RDIM-notopened-${typeCode}-${zone.desc}`, html);
+        continue;
+      }
+      if (!zoneTitle.includes("RDIN")) {
+        console.warn(`      [zone] ${typeLabel}/${zone.desc}: expected RDIN, got "${zoneTitle}" — stopping the zone walk`);
+        break typeLoop;
+      }
+      dumpPolarPage(`RDIN-${typeCode}-${zone.desc}`, html);
+      const rdinF = { ...parseJsBuiltFields(html), ...parseFormFieldsFromHtml(html) };
+      const selFareField = Object.keys(rdinF).find((k) => k.endsWith("-SELFARE")) ?? "F400150001_CMRDIN-SELFARE";
+      const rows = parseZoneDeckRows(html);
+      console.log(`      [zone] ${typeLabel}/${zone.desc}: ${rows.length} deck/category row(s), ${rows.filter((r) => isBookableStatus(r.status)).length} bookable`);
+
+      for (const row of rows) {
+        const bookable = isBookableStatus(row.status);
+        let cat = cats.get(row.code);
+        if (!cat) {
+          if (cats.size >= maxCategories) continue;
+          const capMatch = row.code.match(/(\d+)$/);
+          cat = {
+            code: row.code, name: `${row.code} ${row.type}`,
+            group: ZONE_TYPE_TO_GROUP[row.type.toLowerCase()] ?? "Other",
+            capacity: capMatch ? parseInt(capMatch[1], 10) : null,
+            status: bookable ? "Available" : row.status.toUpperCase() === "W" ? "Waitlist" : "Closed", avlResult: bookable ? "OK" : "SLD", avail: 0,
+            cabinPrice: row.price, perPersonPrice: row.price,
+            promos: row.promo ? [row.promo] : [], cabins: [],
+          };
+          cats.set(row.code, cat);
+        } else {
+          if (bookable && cat.avlResult !== "OK") { cat.status = "Available"; cat.avlResult = "OK"; }
+          if (row.price != null && (cat.cabinPrice == null || row.price < cat.cabinPrice)) {
+            cat.cabinPrice = row.price; cat.perPersonPrice = row.price;
+          }
+          if (row.promo && !cat.promos.includes(row.promo)) cat.promos.push(row.promo);
+        }
+        if (!bookable || !row.selectable) continue;
+
+        console.log(`    [stateroom] ${row.code} ${row.type} · deck ${row.deckNumber ?? "?"} ${row.deckName} · ${zone.desc}`);
+        const clearRows = Object.fromEntries(rows.map((r) => [r.field, ""]));
+        const firstHtml = await polarHttpPost(workPage, { ...rdinF, ...clearRows, [row.field]: "S", [selFareField]: "1" }, "DFH_ENTER", stateToken);
+        const firstTitle = htmlTitle(firstHtml);
+        if (firstTitle.includes("RDIN")) {
+          const why = firstHtml.match(/RDIN-\d+[A-Z][^<"]{0,120}/)?.[0]?.replace(/\s+/g, " ").trim() ?? "no message";
+          console.log(`      → selection not accepted: ${why}`);
+          dumpPolarPage(`RDIN-rejected-${row.code}`, firstHtml);
+          continue;
+        }
+        if (firstTitle.includes("CICS Web")) { console.warn("      [zone] CICS error — stopping the zone walk"); break typeLoop; }
+        const cabins = await readCabinListFromSelection(workPage, firstHtml, stateToken, ["RDIN"]);
+        console.log(`      → ${cabins.length} cabins (direct POST)`);
+        for (const cb of cabins) {
+          if (cat.cabins.some((c) => c.cabinNumber === cb.cabinNumber)) continue;
+          cat.cabins.push({ ...cb, deckName: row.deckName || cb.deckName, deckNumber: row.deckNumber ?? cb.deckNumber, location: cb.location || zone.desc });
+        }
+      }
+
+      // back to RDIM for the next zone
+      html = await polarHttpPost(workPage, rdinF, "DFH_PF12", stateToken);
+      if (!htmlTitle(html).includes("RDIM")) {
+        console.warn(`      [zone] PF12 from RDIN landed on "${htmlTitle(html)}" — stopping the zone walk`);
+        break typeLoop;
+      }
+    }
+  }
+
+  const pricing = [...cats.values()];
+  for (const c of pricing) c.avail = c.cabins.length;
+  return pricing;
 }
 
 // Port code → human name (add more as encountered)
@@ -255,7 +512,28 @@ function parseDate(ddmmmyy) {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-export async function ensureAuthentication(session, { user, pass }) {
+// The portal sometimes answers the SSO relay with its ASP.NET error page
+// (…/error.aspx?aspxerrorpath=/Login.aspx) — seen when two logins for the same
+// account overlap, or just intermittently (scheduled run #502, 2026-09-25). A
+// second try a little later works, so retry instead of failing the whole run.
+export async function ensureAuthentication(session, credentials) {
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await attemptCcsLogin(session, credentials);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === MAX_ATTEMPTS || !/CCS login failed/.test(err.message)) break;
+      const waitMs = 20000 * attempt;
+      console.log(`[ccs-auth] login attempt ${attempt}/${MAX_ATTEMPTS} failed (${err.message.split("\n")[0].slice(0, 140)}) — retrying in ${waitMs / 1000}s`);
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr;
+}
+
+async function attemptCcsLogin(session, { user, pass }) {
   const { page } = session;
   await page.goto("https://www.completecruisesolution.com/Login.aspx", { waitUntil: "networkidle", timeout: 40000 });
   await page.waitForFunction(
@@ -283,8 +561,9 @@ export async function ensureAuthentication(session, { user, pass }) {
   // CCS uses SSO via onesourcecruises.com — the flow is:
   //   completecruisesolution.com/Login.aspx → onesourcecruises.com/onesource/login → back to CCS
   // Wait for the SSO relay to complete and land back on completecruisesolution.com
+  const isErrorPage = (u) => /\/error\.aspx$/i.test(u.pathname);
   await page.waitForURL(
-    url => url.toString().includes('completecruisesolution.com') && !url.toString().includes('Login.aspx'),
+    url => url.toString().includes('completecruisesolution.com') && (isErrorPage(url) || !/\/login\.aspx$/i.test(url.pathname)),
     { timeout: 120000 }
   ).catch(async () => {
     console.log(`[ccs-auth] waitForURL timed out, current url="${page.url()}"`);
@@ -298,7 +577,8 @@ export async function ensureAuthentication(session, { user, pass }) {
 
   // Must be on CCS domain (not Login page, not still on onesource SSO relay)
   const finalUrl = page.url();
-  const onCCS = finalUrl.includes('completecruisesolution.com') && !finalUrl.includes('Login.aspx');
+  const finalPath = new URL(finalUrl).pathname;
+  const onCCS = finalUrl.includes('completecruisesolution.com') && !/\/(login|error)\.aspx$/i.test(finalPath);
   if (!onCCS) {
     const errText = await page.locator('#lblError, .error, .alert-danger, #ctl00_MainContent_lblError').first().innerText().catch(() => null);
     throw new Error(`CCS login failed — still on "${finalUrl}" after SSO. Error: ${errText ?? '(none)'}`);
@@ -567,7 +847,7 @@ async function extractVoyageList(workPage) {
 async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
   // Verify we're on the availability page before starting
   const startTitle = await workPage.title();
-  if (!startTitle.includes('Availability') && !startTitle.includes('RDLV')) {
+  if (!isAvailabilityByDate(startTitle)) {
     throw new Error(`Expected availability page but got: ${startTitle}`);
   }
 
@@ -650,7 +930,9 @@ async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
     console.log(`    [warn] expected Category Fares, got: ${curTitle}`);
   }
 
-  const pricing = await extractFareTable(workPage);
+  // Princess zone layout has no fare table — see getPricingByShipZone
+  const isZoneLayout = curTitle.includes("RDIM");
+  let pricing = isZoneLayout ? [] : await extractFareTable(workPage);
 
   // Capture RDIC state for direct-POST cabin fetching (browser stays on RDIC throughout)
   const rdicHtml     = await workPage.content();
@@ -660,11 +942,20 @@ async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
   const selCatField  = rdicNextIds.find(f => f.includes("SELCAT"))  ?? "F410220002_CMRDIC-SELCAT";
   const selFareField = rdicNextIds.find(f => f.includes("SELFARE")) ?? "F410150001_CMRDIC-SELFARE";
   console.log(`    [post] token="${stateToken}" selCat="${selCatField}"`);
+  if (isZoneLayout) {
+    dumpPolarPage("RDIM", rdicHtml);
+    try {
+      pricing = await getPricingByShipZone(workPage, rdicHtml, stateToken, maxCategories);
+    } catch (err) {
+      console.warn(`    [zone] zone walk failed: ${err.message.split("\n")[0]}`);
+    }
+    console.log(`    [zone] ${pricing.length} categories, ${pricing.reduce((n, c) => n + c.cabins.length, 0)} cabins`);
+  }
 
   // For each available category, use direct HTTP POST to fetch cabin data.
   // The browser stays on RDIC — page.request.post() is out-of-band (shares cookies).
   // Falls back to browser click if direct POST fails.
-  for (let i = 0; i < Math.min(pricing.length, maxCategories); i++) {
+  for (let i = 0; !isZoneLayout && i < Math.min(pricing.length, maxCategories); i++) {
     const cat = pricing[i];
     if (cat.avlResult === 'SLD' || cat.avail === 0) {
       cat.cabins = [];
@@ -674,7 +965,8 @@ async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
     if (stateToken) {
       try {
         cat.cabins = await getCabinsForCategoryDirect(workPage, rdicF, selCatField, selFareField, cat.code, stateToken);
-        console.log(`      → ${cat.cabins.length} cabins (direct POST)`);
+        console.log(`      → ${cat.cabins.length} cabins (direct POST)${cat.cabins.waitlistOnly ? " — waitlist only" : ""}`);
+        if (cat.cabins.waitlistOnly) { cat.status = "Waitlist"; cat.avlResult = "WTL"; }
         // Fare-table avail is a separate, momentary POLAR count that can lag
         // behind the actual stateroom list — the cabin list is ground truth
         // for "how many can be picked", so reconcile avail to match it.
@@ -705,7 +997,7 @@ async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
   // waitForNavigation is unreliable for POLAR POSTs, so we poll document.title.
   for (let step = 0; step < 7; step++) {
     const t = await workPage.title();
-    if (t.includes('Availability') || t.includes('RDLV')) break;
+    if (isAvailabilityByDate(t)) break;
     console.log(`    [back] step ${step+1}: leaving "${t}"`);
 
     const backLink = workPage.locator('a, input[type="button"], input[type="submit"]')
@@ -744,13 +1036,13 @@ async function getVoyagePricing(workPage, voyage, maxCategories = Infinity) {
   // history-back and return the data either way.
   const endTitle = await workPage.title();
   console.log(`    [back] final page: "${endTitle}"`);
-  if (!endTitle.includes('Availability') && !endTitle.includes('RDLV')) {
+  if (!isAvailabilityByDate(endTitle)) {
     console.warn(`    [back] not on availability page (${endTitle}) — recovering, pricing kept`);
     for (let i = 0; i < 3; i++) {
       await workPage.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       await sleep(1200);
       const t2 = await workPage.title().catch(() => "");
-      if (t2.includes('Availability') || t2.includes('RDLV')) {
+      if (isAvailabilityByDate(t2)) {
         console.log(`    [back] recovered to availability via history`);
         break;
       }
@@ -1035,12 +1327,32 @@ async function backToSearch(workPage, allowReload = true) {
   return false;
 }
 
+// Back to the RDLT search form for the NEXT date batch of a multi-page search.
+// backToSearch() answers false on POLAR's MAIN MENU (session reset) and on other
+// off-transaction pages, and both paging loops used to `break` there without a
+// word — silently dropping every later page. The scheduled gohal run #507 came
+// back with 8 Holland America voyages instead of up to 40 because of it.
+// ensureOnPolarSearch() knows how to climb back from those pages, so try it
+// before giving up, and say so when we do give up.
+async function backToSearchForPaging(workPage, label) {
+  if (await backToSearch(workPage)) return true;
+  console.log(`[${label}] backToSearch gave up on "${await workPage.title().catch(() => "?")}" — trying full recovery to keep paging`);
+  const ok = await ensureOnPolarSearch(workPage).catch(() => false);
+  if (!ok) console.log(`[${label}] could not get back to the search form — paging stops here`);
+  return ok;
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 // Shared helper: given an already-loaded POLAR "Sailing Search" (RDLT) page,
 // submit the date search, find the voyage by code, extract cabin categories.
 // Used by both CCS (fetchVoyageByCode) and Gohal (fetchGohalVoyageByCode).
-export async function fetchPolarVoyageOnPage(workPage, voyageCode, sailDate) {
+// Shared by the single-voyage refresh (fetchPolarVoyageOnPage) and the bulk
+// search (runPolarSearchFlow). The bulk path used to call searchByDate() with no
+// check at all, so whenever POLAR resumed a stale CICS session on any page other
+// than RDLT the whole run died with "waiting for locator('input[name=AIRCITY_1]')"
+// (gohal run 457, CCS-B run 455). Returns true once the search form is present.
+export async function ensureOnPolarSearch(workPage, allowReload = true) {
   // Ensure we're on RDLT (Sailing Search) before filling the form.
   // POLAR (CICS) resumes the last session state. Strategy depends on which page
   // POLAR landed on:
@@ -1102,6 +1414,24 @@ export async function fetchPolarVoyageOnPage(workPage, voyageCode, sailDate) {
     }
   }
 
+  const reachedSearch = await workPage.locator('input[name="AIRCITY_1"]').isVisible({ timeout: 5000 }).catch(() => false);
+  if (reachedSearch) return true;
+
+  // A CICS error page recovers on a plain reload elsewhere in this file
+  // (backToSearch) — give the same chance here, once, before giving up.
+  const endTitle = await workPage.title().catch(() => "");
+  if (allowReload && /error|abend|cics web/i.test(endTitle)) {
+    console.log(`[polar] still on a CICS error page ("${endTitle}") — reloading once and retrying`);
+    await workPage.reload({ waitUntil: "networkidle", timeout: 15000 }).catch(() => {});
+    await sleep(1000);
+    return ensureOnPolarSearch(workPage, false);
+  }
+  return false;
+}
+
+export async function fetchPolarVoyageOnPage(workPage, voyageCode, sailDate) {
+  await ensureOnPolarSearch(workPage);
+
   await searchByDate(workPage, { homeCity: "LON", sailDate, occupancy: 2 });
   console.log(`[polar] after search: title="${await workPage.title()}" url="${workPage.url()}"`);
 
@@ -1120,7 +1450,7 @@ export async function fetchPolarVoyageOnPage(workPage, voyageCode, sailDate) {
       const lastDate = voyages.map(v => parseDate(v.depDate)).filter(Boolean).sort((a, b) => b - a)[0];
       if (!lastDate) break;
       currentSailDate = formatPolarDate(new Date(lastDate.getTime() + 86400000));
-      const backOk = await backToSearch(workPage);
+      const backOk = await backToSearchForPaging(workPage, "polar");
       if (!backOk) break;
       await searchByDate(workPage, { homeCity: "LON", sailDate: currentSailDate, occupancy: 2 });
     }
@@ -1179,6 +1509,9 @@ export async function runPolarSearchFlow(workPage, options = {}, vendorKey = "po
 
   const shipFilter = shipName ? shipName.trim().toUpperCase() : null;
 
+  if (!(await ensureOnPolarSearch(workPage))) {
+    throw new Error(`[${vendorKey}] POLAR never reached the sailing-search page (title="${await workPage.title().catch(() => "?")}")`);
+  }
   await searchByDate(workPage, { homeCity, sailDate, occupancy });
 
   const allVoyages = [];
@@ -1306,7 +1639,7 @@ export async function runPolarSearchFlow(workPage, options = {}, vendorKey = "po
     currentDate = formatPolarDate(nextDate);
     console.log(`[${vendorKey}] Advancing search to ${currentDate}`);
 
-    const backOk = await backToSearch(workPage);
+    const backOk = await backToSearchForPaging(workPage, vendorKey);
     if (!backOk) break;
     await searchByDate(workPage, { homeCity, sailDate: currentDate, occupancy });
   }
@@ -1342,16 +1675,30 @@ export function createCcsRunner(account) {
       const authResult = await ensureAuthentication(session, { user: cfg.user, pass: cfg.pass });
       const allCruises = [];
 
+      // One brand failing (POLAR resuming a stale page, a CICS error, ...) used to
+      // throw out of this loop, so the run failed with 0 saved and the voyages the
+      // earlier brands had already collected were thrown away too. Isolate each
+      // brand; only fail the run if every brand failed.
+      const brandErrors = [];
       for (const b of brandList) {
         console.log(`[${cfg.vendorKey}] scraping brand: ${b}`);
-        const workPage = await navigateToPolarBooking(session.page, { brand: b });
-        const voyages  = await runPolarSearchFlow(workPage, { homeCity, sailDate, occupancy, maxPages, maxCruises, maxCategories, shipName }, "CCS");
-        voyages.forEach((v) => allCruises.push({ ...v, cruiseLine: b }));
-        console.log(`[${cfg.vendorKey}] ${b}: ${voyages.length} voyages`);
-
-        // POLAR opened in a popup — close it so the next brand starts clean
-        if (workPage !== session.page) await workPage.close().catch(() => {});
+        let workPage = null;
+        try {
+          workPage = await navigateToPolarBooking(session.page, { brand: b });
+          const voyages = await runPolarSearchFlow(workPage, { homeCity, sailDate, occupancy, maxPages, maxCruises, maxCategories, shipName }, "CCS");
+          voyages.forEach((v) => allCruises.push({ ...v, cruiseLine: b }));
+          console.log(`[${cfg.vendorKey}] ${b}: ${voyages.length} voyages`);
+        } catch (err) {
+          brandErrors.push(`${b}: ${err.message.split("\n")[0]}`);
+          console.error(`[${cfg.vendorKey}] brand ${b} failed — continuing with the next one: ${err.message.split("\n")[0]}`);
+        } finally {
+          // POLAR opened in a popup — close it so the next brand starts clean
+          if (workPage && workPage !== session.page) await workPage.close().catch(() => {});
+        }
         await sleep(2000);
+      }
+      if (brandErrors.length === brandList.length) {
+        throw new Error(`All ${brandList.length} brand(s) failed — ${brandErrors.join(" | ")}`);
       }
 
       return {

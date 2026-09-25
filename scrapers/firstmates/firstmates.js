@@ -1,5 +1,7 @@
 import dotenv from "dotenv";
 import { createScraperSession } from "../runtime.js";
+import { ingestCruise } from "../../services/cruiseIngestionService.js";
+import prisma from "../../config/prisma.js";
 
 dotenv.config();
 
@@ -119,6 +121,15 @@ function inferCruiseConfidence(item) {
   return (item.ctgsVal?.length ?? 0) > 0 ? "Medium" : "Low";
 }
 
+// /availability/pkgs returns `ship` as a bare 2-letter fleet code, so all 204
+// stored FirstMates sailings read "SC"/"VL"/"BR"/"RS" and a search for
+// "Scarlet Lady" found nothing (same gap Azamara had). The site's own Ship
+// dropdown labels them "SC Scarlet Lady", "BR Brilliant Lady", ... — resolve the
+// display name here so it stays fixed on every re-scrape; shipCode keeps the raw code.
+const FIRSTMATES_SHIP_NAMES = {
+  SC: "Scarlet Lady", VL: "Valiant Lady", RS: "Resilient Lady", BR: "Brilliant Lady",
+};
+
 function normalizeFirstMatesCruise(item) {
   const id = item.pkg?.pkgCode ?? null;
   if (!id) return null;
@@ -128,7 +139,7 @@ function normalizeFirstMatesCruise(item) {
 
   return {
     id,
-    ship:        item.ship ?? null,
+    ship:        FIRSTMATES_SHIP_NAMES[item.ship] ?? item.ship ?? null,
     shipCode:    item.ship ?? null,
     shipDetails: null,
     package:     item.pkg?.pkgName ?? null,
@@ -606,7 +617,7 @@ function toCabinsFromEntity(list) {
 // and the captured body — category swapped, no more clicking. ~80s for a whole
 // voyage regardless of category count.
 async function fetchFirstMatesCabinData(page, match) {
-  const { searchFrame, pkgsResponse, authToken } = await reachVoyageSearchAndSearchCached(page);
+  const { searchFrame, pkgsResponse, authToken } = await reachVoyageSearchAndSearchCached(page, null, sailingPeriod(match));
 
   // Live availability can shift between the original bulk search and this
   // (possibly re-run) search — re-derive the category list from THIS exact
@@ -736,7 +747,7 @@ async function fetchFirstMatesCabinData(page, match) {
 
 let cachedFirstMatesSession = null;
 let firstMatesQueue = Promise.resolve();
-let cachedSearchState = null; // { searchFrame, pkgsResponse } for the current bulk search
+let cachedSearchState = null; // { key, state: { searchFrame, pkgsResponse, authToken } } for the current search month
 
 async function getOrCreateFirstMatesSession() {
   if (cachedFirstMatesSession) {
@@ -760,12 +771,30 @@ function runExclusiveFirstMates(fn) {
   return result;
 }
 
-// Cached wrapper so a run of multiple voyages against the SAME broad search
+// Cached wrapper so a run of multiple voyages against the SAME search
 // window only searches once, then re-selects a different row per voyage.
-async function reachVoyageSearchAndSearchCached(page, shipName = null) {
-  if (cachedSearchState) return cachedSearchState;
-  cachedSearchState = await reachVoyageSearchAndSearch(page, shipName);
-  return cachedSearchState;
+// The cache is keyed by the searched month: the form covers exactly ONE month, so
+// a cached search of another month can never contain the voyage being asked for.
+async function reachVoyageSearchAndSearchCached(page, shipName = null, period = null) {
+  const key = period ? `${period.year}-${period.monthIndex}` : "default";
+  if (cachedSearchState?.key === key) return cachedSearchState.state;
+  const state = await reachVoyageSearchAndSearch(page, shipName, period);
+  cachedSearchState = { key, state };
+  return state;
+}
+
+// The month a sailing departs in, as the search form's Month/Year dropdowns want it.
+// Without it the cabin fetch searched the form's DEFAULT month, so only sailings
+// departing in that month could ever be selected — every other sailing failed with
+// "Cabins page never appeared" (both in bulk deck passes and single refreshes),
+// which is why only 3 of 187 firstmates cruises ever got cabin data.
+function sailingPeriod(cruise) {
+  const raw = cruise?.startDate;
+  if (!raw) return null;
+  const iso = typeof raw === "string" ? raw.match(/^(\d{4})-(\d{2})/) : null;
+  if (iso) return { year: Number(iso[1]), monthIndex: Number(iso[2]) - 1 };
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : { year: d.getFullYear(), monthIndex: d.getMonth() };
 }
 
 function invalidateSearchCache() {
@@ -797,13 +826,27 @@ export async function authenticateFirstMates() {
  * search, finds the matching cruise by code, then fetches real cabin+deck
  * data for every category via the confirmed active-booking flow.
  */
-export async function fetchFirstMatesVoyageByCode(cruiseCode) {
+export async function fetchFirstMatesVoyageByCode(cruiseCode, startDate = null) {
   return runExclusiveFirstMates(async () => {
     const session = await getOrCreateFirstMatesSession();
     await ensureFirstMatesAuthentication(session);
     invalidateSearchCache();
 
-    const { pkgsResponse } = await reachVoyageSearchAndSearchCached(session.page);
+    // The search form only ever covers ONE month (whatever it defaults to unless the
+    // Month/Year dropdowns are set), so without the sailing's own month only
+    // cruises departing in the default month could ever be found — every other
+    // sailing's individual refresh failed with "not found in search results".
+    // Codes look like RS2609285NPP = ship RS + yy mm dd 26-09-28 + package.
+    let sail = startDate ? new Date(startDate) : null;
+    if (!sail || Number.isNaN(sail.getTime())) {
+      const m = String(cruiseCode).match(/^[A-Z]{2}(\d{2})(\d{2})(\d{2})/);
+      sail = m ? new Date(Date.UTC(2000 + Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12)) : null;
+    }
+    const period = sail ? { monthIndex: sail.getUTCMonth(), year: sail.getUTCFullYear() } : null;
+
+    // Cached (keyed by month) so the cabin fetch below reuses this very search
+    // instead of running a second one.
+    const { pkgsResponse } = await reachVoyageSearchAndSearchCached(session.page, null, period);
     const items = Array.isArray(pkgsResponse) ? pkgsResponse : [];
     const cruises = items.map(normalizeFirstMatesCruise).filter((c) => c?.id);
 
@@ -870,14 +913,50 @@ export async function runFirstMatesScraper(options = {}) {
       const limit = Math.min(cruises.length, maxDeckCruises);
       console.log(`\n[firstmates] Full detail mode — fetching cabin data for ${limit}/${cruises.length} cruises`);
 
-      for (let i = 0; i < limit; i++) {
-        console.log(`\n[firstmates] [${i + 1}/${limit}] cabin fetch: ${cruises[i].id}`);
+      // The pass used to walk the search results in list order with a cap, so it kept
+      // re-visiting the same first few sailings (some already departed) and never got
+      // to the gaps, and nothing was saved until the whole run ended. Order: sailings
+      // still ahead that have no cabin rows yet -> already covered -> already sailed.
+      let vendorId = null;
+      let have = new Set();
+      try {
+        vendorId = (await prisma.vendor.findFirst({ where: { slug: "firstmates" }, select: { id: true } }))?.id ?? null;
+        if (vendorId) {
+          have = new Set((await prisma.cruise.findMany({
+            where: { vendorId, cabinCategories: { some: { cabins: { some: {} } } } }, select: { code: true }
+          })).map((c) => c.code));
+        }
+      } catch (err) {
+        console.log(`[firstmates] ordering-by-DB-state failed (${err.message}) — falling back to list order`);
+      }
+      const now = Date.now();
+      const rank = (c) => {
+        const t = c.startDate ? new Date(c.startDate).getTime() : null;
+        if (t !== null && t < now) return 3;   // already sailed
+        if (have.has(c.id)) return 2;          // already has decks
+        return 1;                              // real gap
+      };
+      const order = cruises.map((_, idx) => idx).sort((a, b) => rank(cruises[a]) - rank(cruises[b]));
+      console.log(`[firstmates] ${order.filter((idx) => rank(cruises[idx]) === 1).length}/${cruises.length} sailings still ahead and without cabin data — those go first`);
+
+      for (let n = 0; n < limit; n++) {
+        const i = order[n];
+        console.log(`\n[firstmates] [${n + 1}/${limit}] cabin fetch: ${cruises[i].id}`);
         try {
           invalidateSearchCache();
           const enriched = await fetchFirstMatesCabinData(session.page, cruises[i]);
           if (enriched) cruises[i] = enriched;
+          // Save as soon as this sailing has cabins instead of at the end of the run.
+          if (vendorId && (cruises[i].cabinCategories ?? []).some((c) => (c.cabins ?? []).length > 0)) {
+            try {
+              await ingestCruise(vendorId, cruises[i]);
+              console.log(`[firstmates] ${cruises[i].id} saved to DB`);
+            } catch (saveErr) {
+              console.error(`[firstmates] ${cruises[i].id} save failed: ${saveErr.message}`);
+            }
+          }
         } catch (err) {
-          console.error(`[firstmates] [${i + 1}/${limit}] cabin fetch failed: ${err.message}`);
+          console.error(`[firstmates] [${n + 1}/${limit}] cabin fetch failed: ${err.message}`);
         }
       }
     }

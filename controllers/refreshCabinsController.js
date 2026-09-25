@@ -114,9 +114,15 @@ async function fetchFreshCategories(vendorSlug, cruiseCode, startDate, shipCode 
     const creds = isB
       ? { user: process.env.CCS_B_USER, pass: process.env.CCS_B_PASS }
       : { user: process.env.CCS_USER,   pass: process.env.CCS_PASS };
-    // cruiseLine tags on CCS cruises: "PO" (default), "CUNARD", "PRINCESS" —
-    // POLAR must be switched to that brand or the voyage won't be found.
-    const ccsBrand = ["CUNARD", "PRINCESS", "PO"].includes(cruiseLine) ? cruiseLine : null;
+    // POLAR must be switched to the cruise's brand or the voyage won't be found.
+    // Cruises carry either the brand key ("PO"/"CUNARD"/"PRINCESS") or, as ingestion
+    // stores them now, the display name — the display names used to fall through to
+    // null, i.e. the default P&O brand, so Cunard/Princess refreshes never found their voyage.
+    const CCS_BRAND_BY_LINE = {
+      PO: "PO", CUNARD: "CUNARD", PRINCESS: "PRINCESS",
+      "P&O Cruises": "PO", "Cunard Line": "CUNARD", "Cunard": "CUNARD", "Princess Cruises": "PRINCESS",
+    };
+    const ccsBrand = CCS_BRAND_BY_LINE[cruiseLine] ?? null;
     return runExclusiveCcs(key, async () => {
       const session = await getOrCreateCcsSession(key);
       const result = await fetchVoyageByCode(session, creds, cruiseCode, toDDMmmYY(base), ccsBrand);
@@ -140,7 +146,7 @@ async function fetchFreshCategories(vendorSlug, cruiseCode, startDate, shipCode 
   }
 
   if (vendorSlug === "firstmates") {
-    return fetchFirstMatesVoyageByCode(cruiseCode);
+    return fetchFirstMatesVoyageByCode(cruiseCode, base);
   }
 
   if (vendorSlug === "goccl") {

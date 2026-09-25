@@ -1088,7 +1088,7 @@ export async function fetchGocclVoyageByCode(cruiseCode, startDate) {
     const mmyyyy = `${String(dep.getMonth() + 1).padStart(2, "0")}${dep.getFullYear()}`;
     const result = await fetchGocclCruises(session.page, { sailingDateFrom: mmyyyy, sailingDateTo: mmyyyy });
     const match = result.cruises.find((c) => c.id === cruiseCode);
-    if (!match) throw new Error(`Voyage ${cruiseCode} not found in GOCCL search for ${mmyyyy}`);
+    if (!match) throw new Error(`Voyage ${cruiseCode} not found in GOCCL search for ${mmyyyy} (search returned ${result.cruises.length} sailings: ${result.cruises.slice(0, 6).map((c) => c.id).join(", ") || "none"})`);
 
     const cabinCategories = await fetchGocclDeckDataForSailing(session.page, match, { maxLoadMore: 10 });
     if (!cabinCategories.length) throw new Error(`No cabin categories returned for ${cruiseCode}`);

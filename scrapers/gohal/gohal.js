@@ -205,19 +205,47 @@ export async function runGohalScraper(options = {}) {
     const authResult = await ensureGohalAuthentication(session);
     const allVoyages = [];
 
+    // A company failing (the Seabourn hop kept landing on the wrong booking page,
+    // and any stale-CICS page killed the search form) used to throw out of this
+    // loop: the run failed with 0 saved and the voyages HA/CU had already found
+    // were discarded. Isolate each company; only fail the run if all of them fail.
+    const companyErrors = [];
     for (const companyCode of companyCodes) {
       console.log(`[gohal] scraping company: ${companyCode} (${GOHAL_COMPANY_NAMES[companyCode] ?? companyCode})`);
-      const polarPage = await navigateToPolar(session, companyCode);
-      const voyages   = await runPolarSearchFlow(polarPage, { homeCity, sailDate, occupancy, maxPages, maxCruises, shipName }, "gohal");
+      // One retry per company: a transient failure (the POLAR popup opening on
+      // chrome-error://, a dropped connection — scheduled run #507 lost both Cunard
+      // and Seabourn that way while a rerun minutes later worked) shouldn't cost the
+      // company for a whole scheduling cycle (3 days for "near", 14 for "far").
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        let polarPage = null;
+        try {
+          polarPage = await navigateToPolar(session, companyCode);
+          const voyages = await runPolarSearchFlow(polarPage, { homeCity, sailDate, occupancy, maxPages, maxCruises, shipName }, "gohal");
 
-      // Tag each voyage with its cruise line so it's saved correctly in DB
-      const cruiseLine = GOHAL_COMPANY_NAMES[companyCode] ?? companyCode;
-      voyages.forEach((v) => { v.cruiseLine = cruiseLine; });
-      allVoyages.push(...voyages);
+          // Tag each voyage with its cruise line so it's saved correctly in DB
+          const cruiseLine = GOHAL_COMPANY_NAMES[companyCode] ?? companyCode;
+          voyages.forEach((v) => { v.cruiseLine = cruiseLine; });
+          allVoyages.push(...voyages);
 
-      console.log(`[gohal] ${companyCode}: ${voyages.length} voyages found`);
-      await polarPage.close().catch(() => {});
+          console.log(`[gohal] ${companyCode}: ${voyages.length} voyages found`);
+          break;
+        } catch (err) {
+          const reason = err.message.split("\n")[0];
+          if (attempt < 2) {
+            console.error(`[gohal] company ${companyCode} failed (attempt ${attempt}/2): ${reason} — retrying in 30s`);
+            await sleep(30000);
+            continue;
+          }
+          companyErrors.push(`${companyCode}: ${reason}`);
+          console.error(`[gohal] company ${companyCode} failed — continuing with the next one: ${reason}`);
+        } finally {
+          if (polarPage) await polarPage.close().catch(() => {});
+        }
+      }
       await sleep(2000);
+    }
+    if (companyErrors.length === companyCodes.length) {
+      throw new Error(`All ${companyCodes.length} company(ies) failed — ${companyErrors.join(" | ")}`);
     }
 
     return {

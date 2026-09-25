@@ -375,6 +375,11 @@ async function fetchAvailabilityPkgs(page, options, expectFromDate = null) {
     },
     { timeout: 90000 }
   );
+  // Awaited much later (the Promise.race below). If anything between here and there
+  // throws or stalls past 90s this rejects with nobody listening — an unhandled
+  // rejection that used to kill the whole server process. Mark it handled; the
+  // race still sees the rejection.
+  responsePromise.catch(() => {});
 
   // The button lives at the bottom of the search-results panel — invoke its
   // click via JS directly to bypass viewport visibility checks.
@@ -1195,8 +1200,11 @@ export async function fetchAzamaraVoyageByCode(cruiseCode, startDate, occupancy 
     await ensureAzamaraAuthentication(session);
 
     const dep      = new Date(startDate);
-    const fromDate = new Date(dep.getTime() - 86400000).toISOString().slice(0, 10);
-    const toDate   = new Date(dep.getTime() + 86400000).toISOString().slice(0, 10);
+    // A ±1 day window came back with 0 sailings (or no /availability/pkgs response at
+    // all) for sailings that are on sale, while month-wide windows — what the bulk run
+    // uses — return them. Search a fortnight either side and match the sailing by code.
+    const fromDate = new Date(dep.getTime() - 14 * 86400000).toISOString().slice(0, 10);
+    const toDate   = new Date(dep.getTime() + 14 * 86400000).toISOString().slice(0, 10);
 
     const raw   = await fetchAvailabilityPkgs(session.page, { fromDate, toDate, occupancy }, fromDate);
     const items = Array.isArray(raw) ? raw : (raw?.data ?? []);
@@ -1204,7 +1212,7 @@ export async function fetchAzamaraVoyageByCode(cruiseCode, startDate, occupancy 
 
     const positionIndex = cruises.findIndex((c) => c.id === cruiseCode);
     const match = cruises[positionIndex];
-    if (!match) throw new Error(`Voyage ${cruiseCode} not found in Azamara search for ${fromDate} to ${toDate}`);
+    if (!match) throw new Error(`Voyage ${cruiseCode} not found in Azamara search for ${fromDate} to ${toDate} (search returned ${cruises.length} sailings: ${cruises.slice(0, 6).map((c) => c.id).join(", ") || "none"})`);
 
     await session.page.waitForFunction(
       () => [...document.querySelectorAll("table tbody tr")]

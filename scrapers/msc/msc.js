@@ -14,6 +14,7 @@
 import dotenv from "dotenv";
 import { createScraperSession } from "../runtime.js";
 import prisma from "../../config/prisma.js";
+import { ingestCruise } from "../../services/cruiseIngestionService.js";
 
 dotenv.config();
 
@@ -486,6 +487,8 @@ export async function runMscScraper(options = {}) {
         console.log(`[msc-decks] ordering-by-DB-state failed (${err.message}) — falling back to list order`);
       }
 
+      // Vendor id for the per-cruise save below (plain lookup — no upsert side effects).
+      const mscVendorId = (await prisma.vendor.findFirst({ where: { slug: "msc" }, select: { id: true } }).catch(() => null))?.id ?? null;
       for (const cruise of deckList) {
         if (done >= maxDeckCruises) break;
         done++;
@@ -546,11 +549,29 @@ export async function runMscScraper(options = {}) {
                 })),
               };
             });
-            ok++;
+            // Only a sailing that actually came back with cabins counts as "got
+            // cabin data" — categories with 0 cabins used to be counted too, which
+            // is how "2/2 got cabin data" was reported for a cruise that saved none.
+            const gotCabins = (cruise.cabinCategories ?? []).some((c) => (c.cabins ?? []).length > 0);
+            if (gotCabins) {
+              ok++;
+              // Save it now, not when the whole (multi-hour) run ends: a run that dies
+              // late used to lose every cruise it had already fetched.
+              if (mscVendorId) {
+                try {
+                  await ingestCruise(mscVendorId, cruise);
+                  console.log(`[msc-decks] ${cruise.id} saved to DB`);
+                } catch (saveErr) {
+                  console.error(`[msc-decks] ${cruise.id} save failed: ${saveErr.message}`);
+                }
+              }
+            } else {
+              console.log(`[msc-decks] ${cruise.id}: categories found but 0 cabins — not counted as fetched`);
+            }
             break;
           } catch (err) {
             const msg = err.message.split("\n")[0];
-            const permanent = /Sailing not found/i.test(msg);
+            const permanent = /Sailing not found|not on sale/i.test(msg);
             // "Target page, context or browser has been closed" means the
             // browser itself is gone (killed externally, crashed, etc.) — no
             // amount of retrying within this session can recover, and the
@@ -799,6 +820,64 @@ async function scanTableForSailing(page, { shipCode, sailDate }) {
 // selector no longer exists anywhere on this UI — that mismatch (not any
 // site-side block) was silently preventing every deck-data fetch before
 // this fix.
+// An itinerary card holds one date pill per sailing, and its single "BOOK NOW"
+// books whichever pill is SELECTED — the card opens with its FIRST pill selected.
+// This used to click BOOK NOW without ever selecting the target pill, so every
+// sailing that was not first in its card silently opened (and saved cabins,
+// prices and categories for) the first sibling instead: confirmed live, asking
+// for AS20270108BCNBCN / AS20270115BCNBCN opened AS20270101BCNBCN and stored its
+// 191 cabins under all three codes. Select the pill first and verify it took.
+async function selectPillAndBookNow(page, cruiseCode) {
+  const pill = page.locator(`div[data-cruiseid="${cruiseCode}"] button`).first();
+  // MSC greys out sailings it has closed for sale (near departure / not offered to
+  // agents): the pill reads "<day> N/A" and the card has no BOOK NOW at all, so no
+  // cabins can be fetched — say so plainly instead of a vague "no BOOK NOW button".
+  const pillText = await pill.textContent().catch(() => "");
+  if (/N\/A/i.test(pillText ?? "")) {
+    throw new Error(`${cruiseCode} is marked N/A (not on sale) on MSC — no cabins can be fetched`);
+  }
+  const isSelected = () => pill.evaluate((el) => el.classList.contains("border-msc-blue")).catch(() => false);
+  if (!(await isSelected())) {
+    await pill.scrollIntoViewIfNeeded().catch(() => {});
+    await pill.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(800);
+    const nowSelected = await isSelected();
+    console.log(`[msc] selected date pill for ${cruiseCode}: ${nowSelected}`);
+    if (!nowSelected) {
+      throw new Error(`Could not select the ${cruiseCode} date pill in its card — refusing to BOOK NOW on the card's default sailing`);
+    }
+  }
+  const booked = await page.evaluate((code) => {
+    const tileEl = document.querySelector(`div[data-cruiseid="${code}"]`);
+    const card = tileEl?.closest('[data-scroll-anchor="itinerary-card"]');
+    const bookBtn = [...(card?.querySelectorAll("button, a") ?? [])].find(b => /book now/i.test(b.textContent || ""));
+    if (!bookBtn) return false;
+    bookBtn.scrollIntoView({ block: "center", behavior: "instant" });
+    bookBtn.click();
+    return true;
+  }, cruiseCode);
+  if (!booked) {
+    // A sailing inside the site's closing window (or sold out) shows no BOOK NOW;
+    // say what the card DOES show so that case is distinguishable from a broken selector.
+    const texts = await page.evaluate((code) =>
+      [...(document.querySelector(`div[data-cruiseid="${code}"]`)?.closest('[data-scroll-anchor="itinerary-card"]')?.querySelectorAll("button, a") ?? [])]
+        .map(b => (b.textContent || "").replace(/\s+/g, " ").trim().slice(0, 28)).filter(Boolean), cruiseCode).catch(() => []);
+    console.log(`[msc] no BOOK NOW in the card for ${cruiseCode}; card controls: ${JSON.stringify(texts.slice(0, 12))}`);
+  }
+  return booked;
+}
+
+// CabinSelectionView carries the sailing it is showing as ?partNumber=<cruise
+// code>. If that is not the sailing we asked for, everything read from the page
+// belongs to another cruise — fail instead of saving it under the wrong code.
+function assertOpenedCruise(page, cruiseCode) {
+  let landed = null;
+  try { landed = new URL(page.url()).searchParams.get("partNumber"); } catch { /* not a parsable URL */ }
+  if (landed && landed !== cruiseCode) {
+    throw new Error(`MSC opened ${landed} instead of ${cruiseCode} — refusing to save another sailing's cabins under this code`);
+  }
+}
+
 async function selectSailingViaCardLayout(page, cruiseCode) {
   const cardInfo = await page.evaluate((code) => {
     const allTiles = [...document.querySelectorAll("div[data-cruiseid]")]
@@ -812,20 +891,26 @@ async function selectSailingViaCardLayout(page, cruiseCode) {
   const tile = page.locator(`div[data-cruiseid="${cruiseCode}"]`).first();
   if (await tile.count() === 0) return false;
 
-  const clicked = await page.evaluate((code) => {
-    const tileEl = document.querySelector(`div[data-cruiseid="${code}"]`);
-    const card = tileEl?.closest('[data-scroll-anchor="itinerary-card"]');
-    const bookBtn = [...(card?.querySelectorAll("button, a") ?? [])].find(b => /book now/i.test(b.textContent || ""));
-    if (!bookBtn) return false;
-    bookBtn.scrollIntoView({ block: "center", behavior: "instant" });
-    bookBtn.click();
-    return true;
-  }, cruiseCode);
+  if (process.env.MSC_DEBUG_DUMP) {
+    try {
+      const html = await page.evaluate((code) => {
+        const card = document.querySelector(`div[data-cruiseid="${code}"]`)?.closest('[data-scroll-anchor="itinerary-card"]');
+        return card ? card.outerHTML : null;
+      }, cruiseCode);
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      await mkdir("./debug", { recursive: true });
+      await writeFile(`./debug/msc-card-${cruiseCode}.html`, html ?? "(no card found)");
+      console.log(`[msc] wrote card markup → debug/msc-card-${cruiseCode}.html (${html?.length ?? 0} chars)`);
+    } catch (e) { console.log(`[msc] card dump failed: ${e.message}`); }
+  }
+
+  const clicked = await selectPillAndBookNow(page, cruiseCode);
   if (!clicked) throw new Error(`Found cruise ${cruiseCode} on the card layout but no BOOK NOW button nearby.`);
 
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.waitForTimeout(5000);
   console.log(`[msc] after BOOK NOW, url=${page.url().split("?")[0]}`);
+  assertOpenedCruise(page, cruiseCode);
   return true;
 }
 
@@ -1167,14 +1252,10 @@ async function establishCartAndGetCategories(page, shipCode, cruiseCode) {
       // BOOK NOW should land us on the category grid.
       if (currentUrl.includes("/uk/search/list") && cruiseCode) {
         console.log(`[msc] dirty-cart attempt ${attempt}: on results list — re-clicking BOOK NOW`);
-        await page.evaluate((code) => {
-          const tileEl = document.querySelector(`div[data-cruiseid="${code}"]`);
-          const card = tileEl?.closest('[data-scroll-anchor="itinerary-card"]');
-          const bookBtn = [...(card?.querySelectorAll("button, a") ?? [])].find(b => /book now/i.test(b.textContent || ""));
-          if (bookBtn) { bookBtn.scrollIntoView({ block: "center", behavior: "instant" }); bookBtn.click(); }
-        }, cruiseCode);
+        await selectPillAndBookNow(page, cruiseCode);
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         await page.waitForTimeout(4000);
+        assertOpenedCruise(page, cruiseCode);
         // Check for CONFIRM SELECTION on fresh booking
         const confirmFresh = page.locator("button:visible, a:visible").filter({ hasText: /CONFIRM SELECTION/i }).first();
         if (await confirmFresh.isVisible().catch(() => false)) {
@@ -1437,6 +1518,7 @@ async function establishCartAndGetCategories(page, shipCode, cruiseCode) {
 
   // 3. Call CruiseCabinAvailabilityCmd for each category to get one auto-selected cabin
   const cabinsByCategory = {};
+  let firstRaw = null;   // first raw availability response, kept only to explain an all-zero result below
   if (authParams?.authPassword) {
     console.log(`[msc] fetching cabin availability for ${categoryCodes.length} categories...`);
     for (const catCode of categoryCodes) {
@@ -1461,16 +1543,26 @@ async function establishCartAndGetCategories(page, shipCode, cruiseCode) {
           });
           const t = await r.text();
           const j = JSON.parse(t.replace(/^\s*\/\*/, "").replace(/\*\/\s*$/, ""));
-          return { cabins: j.DtsCruiseCabinAvailabilityResponse?.availableCabins?.availableCabin ?? [], err: null };
-        } catch (e) { return { cabins: [], err: e.message }; }
+          return { cabins: j.DtsCruiseCabinAvailabilityResponse?.availableCabins?.availableCabin ?? [], err: null, raw: t.slice(0, 400) };
+        } catch (e) { return { cabins: [], err: e.message, raw: "" }; }
       }, { ...authParams, categoryCode: catCode }).catch(e => ({ cabins: [], err: e.message }));
 
       cabinsByCategory[catCode] = result.cabins;
+      if (firstRaw === null) firstRaw = result.raw ?? "";
       const nums = result.cabins.map(c => c.cabinNo).join(",");
       console.log(`[msc] avail ${catCode}: ${result.cabins.length} cabin(s)${result.err ? " err="+result.err : ""}${nums ? " ["+nums+"]" : ""}`);
     }
   } else {
     console.log("[msc] no auth params — cabin availability skipped");
+  }
+
+  // Every category answering "0 cabins" while the grid still showed an available
+  // tile and a first cabin had just been captured looks like a failed call, not a
+  // sold-out sailing — but the loop above cannot tell the two apart. Keep the raw
+  // response so the cause is visible instead of silently saving nothing.
+  const totalCabins = Object.values(cabinsByCategory).reduce((n, a) => n + a.length, 0);
+  if (authParams?.authPassword && categoryCodes.length > 0 && totalCabins === 0) {
+    console.log(`[msc] ALL ${categoryCodes.length} categories returned 0 cabins — first raw response: ${JSON.stringify(firstRaw)}`);
   }
 
   return { categoryCodes, cabinsByCategory, categoryPriceByCode };

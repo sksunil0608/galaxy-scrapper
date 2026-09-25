@@ -2,6 +2,8 @@ import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createScraperSession } from "../runtime.js";
+import { ingestCruise } from "../../services/cruiseIngestionService.js";
+import prisma from "../../config/prisma.js";
 
 dotenv.config();
 
@@ -441,9 +443,17 @@ function normalizePromotionEntry(promotion, lookups, brandCode) {
 
 // ── Authentication ───────────────────────────────────────────────────────────
 
+// "Not the login page" is not enough: with an expired session the OAuth chain hops
+// through the identity provider (auth.cruisingpower.com/.../connect/endSession?...)
+// on its way back to /login, and that URL passed the old "no /login in it" test —
+// so the session was reported restored, no login was ever performed, and the run
+// died later with "Could not capture bearer token" (run 483). Only the app host
+// counts as the dashboard.
 function isDashboardUrl(url) {
-  const s = url.toString();
-  return !s.includes("/login") && !s.includes("/oauth/callback");
+  let u;
+  try { u = new URL(url.toString()); } catch { return false; }
+  if (!u.hostname.endsWith("cruisingpower.com") || u.hostname === "auth.cruisingpower.com") return false;
+  return !u.pathname.includes("/login") && !u.pathname.includes("/oauth/callback") && !u.pathname.includes("/connect/");
 }
 
 async function waitForDashboard(page) {
@@ -708,6 +718,26 @@ export async function runCruisingPowerScraper(options = {}) {
         console.log(`[cp-decks] shipName="${shipName}" — ${deckList.length}/${cruises.length} cruises match`);
       }
 
+      // Sailings that already have cabin rows go LAST, so a capped pass reaches the
+      // gaps instead of re-fetching the same covered ones every time (same fix as
+      // goccl/celestyal/azamara/msc). Only a plain vendor lookup here — ensureVendor
+      // would overwrite the vendor's name/url on every call.
+      let cpVendorId = null;
+      try {
+        const vendorRow = await prisma.vendor.findFirst({ where: { slug: "cruisingpower" }, select: { id: true } });
+        cpVendorId = vendorRow?.id ?? null;
+        if (cpVendorId) {
+          const have = new Set((await prisma.cruise.findMany({
+            where: { vendorId: cpVendorId, cabinCategories: { some: { cabins: { some: {} } } } },
+            select: { code: true }
+          })).map((c) => c.code));
+          deckList = [...deckList].sort((a, b) => (have.has(a.id) ? 1 : 0) - (have.has(b.id) ? 1 : 0));
+          console.log(`[cp-decks] ${deckList.filter((c) => !have.has(c.id)).length}/${deckList.length} sailings lack cabin data — those go first`);
+        }
+      } catch (err) {
+        console.log(`[cp-decks] ordering-by-DB-state failed (${err.message}) — falling back to list order`);
+      }
+
       await session.close().catch(() => {});
       let done = 0, ok = 0;
       for (const cruise of deckList) {
@@ -770,6 +800,18 @@ export async function runCruisingPowerScraper(options = {}) {
             }
           }
           ok++;
+          // Save this sailing right now rather than only when the whole pass ends:
+          // a CP deck pass is ~5-10 min per sailing and a run once hung for 3.5 h,
+          // and everything it had fetched was lost because nothing was written
+          // until the very end (same fix already made in goccl.js and azamara.js).
+          if (cpVendorId && (cruise.cabinCategories ?? []).some((c) => (c.cabins ?? []).length > 0)) {
+            try {
+              await ingestCruise(cpVendorId, cruise);
+              console.log(`[cp-decks] ${packageKey} saved to DB`);
+            } catch (saveErr) {
+              console.error(`[cp-decks] ${packageKey} save failed: ${saveErr.message}`);
+            }
+          }
         } catch (err) {
           console.log(`[cp-decks] ${packageKey} failed: ${err.message.split("\n")[0]}`);
         }

@@ -98,6 +98,12 @@ function resolveOptions(tier) {
       // (a run on the 31st asked for 072026-072026 and got 0 sailings). Keep
       // whatever horizon the tier asked for, defaulting to a wide one.
       opts.horizonDays = opts.horizonDays ?? 180;
+      // normalizeDateOptions (vendorScrapeService) only turns horizonDays into the
+      // sailingDateFrom/To month range when a startDate is present — without one
+      // it returns the options untouched and runGocclScraper falls back to the
+      // CURRENT month alone. Every scheduled goccl run therefore searched one
+      // month (12 sailings on 25 Sep) no matter what horizon the tier asked for.
+      opts.startDate = from;
       break;
 
     case "firstmates":
@@ -182,12 +188,13 @@ const TIERS = [
   // (Celebrity). Every tier here used to pass "C", so Royal Caribbean — the
   // other brand this portal serves, and the majority of its voyage catalogue —
   // was never scraped at all. Each brand therefore needs its own tiers.
-  { label: "cruisingpower C 0-30d",   key: "cruisingpower", intervalDays: 1, startHour: 8,  startMin: 30, options: { horizonDays: 30,  brand: "C" }, enabled: true },
-  { label: "cruisingpower C 0-180d",  key: "cruisingpower", intervalDays: 3, startHour: 9,  startMin: 0,  options: { horizonDays: 180, brand: "C" }, enabled: true },
-  { label: "cruisingpower C 0-365d",  key: "cruisingpower", intervalDays: 7, startHour: 9,  startMin: 30, options: { horizonDays: 365, brand: "C" }, enabled: true },
-  { label: "cruisingpower R 0-30d",   key: "cruisingpower", intervalDays: 1, startHour: 15, startMin: 30, options: { horizonDays: 30,  brand: "R" }, enabled: true },
-  { label: "cruisingpower R 0-180d",  key: "cruisingpower", intervalDays: 3, startHour: 16, startMin: 0,  options: { horizonDays: 180, brand: "R" }, enabled: true },
-  { label: "cruisingpower R 0-365d",  key: "cruisingpower", intervalDays: 7, startHour: 16, startMin: 30, options: { horizonDays: 365, brand: "R" }, enabled: true },
+  // PAUSED (2026-09-24): secure.cruisingpower.com rejects the credentials in .env ("Your attempt to sign in was unsuccessful"), and every tier below performs a login — retrying a wrong password risks locking the account. Fix CRUISINGPOWER_USER/CRUISINGPOWER_PASS, then set enabled back to true.
+  { label: "cruisingpower C 0-30d",   key: "cruisingpower", intervalDays: 1, startHour: 8,  startMin: 30, options: { horizonDays: 30,  brand: "C", maxDeckCruises: 6 }, enabled: false },
+  { label: "cruisingpower C 0-180d",  key: "cruisingpower", intervalDays: 3, startHour: 9,  startMin: 0,  options: { horizonDays: 180, brand: "C", maxDeckCruises: 8 }, enabled: false },
+  { label: "cruisingpower C 0-365d",  key: "cruisingpower", intervalDays: 7, startHour: 9,  startMin: 30, options: { horizonDays: 365, brand: "C", maxDeckCruises: 10 }, enabled: false },
+  { label: "cruisingpower R 0-30d",   key: "cruisingpower", intervalDays: 1, startHour: 15, startMin: 30, options: { horizonDays: 30,  brand: "R", maxDeckCruises: 6 }, enabled: false },
+  { label: "cruisingpower R 0-180d",  key: "cruisingpower", intervalDays: 3, startHour: 16, startMin: 0,  options: { horizonDays: 180, brand: "R", maxDeckCruises: 8 }, enabled: false },
+  { label: "cruisingpower R 0-365d",  key: "cruisingpower", intervalDays: 7, startHour: 16, startMin: 30, options: { horizonDays: 365, brand: "R", maxDeckCruises: 10 }, enabled: false },
 
   // ── azamara (2 list tiers + 1 detail tier, fromDate/toDate YYYY-MM-DD) ─
   { label: "azamara 0-30d",   key: "azamara", intervalDays: 2, startHour: 10, startMin: 0,  options: { horizonDays: 30,  occupancy: 2 }, enabled: true },

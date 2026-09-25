@@ -309,14 +309,25 @@ async function ensureCelestyalAuthentication(session) {
 
   // Wait up to 10s for either logged-in indicator OR login button to appear.
   // isVisible() alone is a race — use waitFor on both and take whichever wins.
-  const state = await Promise.race([
-    page.locator("text=Logged in as:").waitFor({ state: "visible", timeout: 10000 })
+  const detectState = (timeout) => Promise.race([
+    page.locator("text=Logged in as:").waitFor({ state: "visible", timeout })
       .then(() => "logged-in"),
-    page.locator("text=CLICK to start a new Cruise Booking").waitFor({ state: "visible", timeout: 10000 })
+    page.locator("text=CLICK to start a new Cruise Booking").waitFor({ state: "visible", timeout })
       .then(() => "logged-in"),
-    page.getByRole("button", { name: /^login$/i }).first().waitFor({ state: "visible", timeout: 10000 })
+    page.getByRole("button", { name: /^login$/i }).first().waitFor({ state: "visible", timeout })
       .then(() => "need-login"),
   ]).catch(() => "unknown");
+
+  let state = await detectState(10000);
+  // "unknown" only means neither indicator showed within 10s — on a busy machine
+  // (the scheduler starts several vendors at the same minute) an already
+  // logged-in session can take far longer than that to render. Treating it as
+  // "log in" made the scraper hunt for a Login button that isn't there and fail
+  // the whole run (scheduled "celestyal detail" run #496). Look again, longer.
+  if (state === "unknown") {
+    console.log("[celestyal] auth state unclear after 10s — waiting longer before deciding");
+    state = await detectState(30000);
+  }
 
   console.log("[celestyal] auth state detected:", state);
 
@@ -338,6 +349,11 @@ async function ensureCelestyalAuthentication(session) {
   await page.goto("https://sale.celestyal.com", { waitUntil: "load", timeout: 60000 });
   await page.waitForTimeout(3000);
   const loginButton = page.getByRole("button", { name: /^login$/i }).first();
+  if (!(await loginButton.isVisible().catch(() => false))
+      && await page.locator("text=Logged in as:").isVisible().catch(() => false)) {
+    console.log("[celestyal] no Login button but already logged in — reusing session");
+    return { success: true, alreadyLoggedIn: true, message: "Celestyal session reused successfully." };
+  }
   await loginButton.click();
   console.log("[celestyal] login modal opened");
 
